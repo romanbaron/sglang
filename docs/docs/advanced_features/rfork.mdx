@@ -100,3 +100,27 @@ python -m sglang.launch_server [args] \
 ```
 
 All SGLang instances use the same command shape. If no ready source exists, the instance loads weights natively and publishes metadata to ModelExpress. If a compatible source exists, it loads weights through ModelExpress P2P transfer. Set <code>"transport": "transfer_engine"</code> to use Mooncake TransferEngine instead of the default NIXL transport.
+
+#### Releasing and reloading weights
+
+When the server runs with `--enable-memory-saver`, `/release_memory_occupation` with the `weights` tag first tells ModelExpress to stop serving this instance as a P2P source. With the NIXL transport, ModelExpress waits for transfers that peers have in flight, so the call can take as long as the largest pending transfer. The `transfer_engine` transport does not wait for them.
+
+What happens on `/resume_memory_occupation` depends on `--enable-weights-cpu-backup`:
+
+- With the backup, the weights come back valid and the instance publishes itself as a source again.
+- Without it, the weights are discarded. Resume the weights, then reload them before you resume the KV cache. The reload reads from another ModelExpress source, or from the checkpoint if no source is ready, and then publishes the instance again. It requires the NIXL transport.
+
+```bash
+curl -X POST http://HOST:PORT/resume_memory_occupation -H "Content-Type: application/json" -d '{"tags": ["weights"]}'
+curl -X POST http://HOST:PORT/update_weights_from_disk -H "Content-Type: application/json" -d '{"model_path": "MODEL_PATH", "load_format": "remote_instance"}'
+curl -X POST http://HOST:PORT/resume_memory_occupation -H "Content-Type: application/json" -d '{"tags": ["kv_cache", "cuda_graph"]}'
+```
+
+`model_path` must be the path the server was started with. `load_format` defaults to the format the server was started with, so you can omit it here; pass a disk format such as `auto` to load a different model instead. Updating weights is rejected while they are released.
+
+Reloading through `remote_instance` reloads only the target model. With speculative decoding, start the server with `--enable-draft-weights-cpu-backup` so the draft weights survive the release; otherwise the reload is rejected.
+
+ModelExpress does not track weights that change another way, such as through `update_weights_from_tensor`. After a release that discarded the weights, such a load leaves the instance unpublished. An instance that is still published, or that resumes from a CPU backup, keeps advertising the changed weights as the model it started with.
+
+{/* TODO: Name the first ModelExpress release that supports releasing and reloading weights. */}
+This requires a ModelExpress package that supports releasing and reloading weights. With an older package, releasing weights unmaps their memory while the instance is still advertised as a source, so peers can read invalid memory.
