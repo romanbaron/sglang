@@ -7,8 +7,10 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.device_config import DeviceConfig
+from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.model_loader.loader import (
+    BaseModelLoader,
     DefaultModelLoader,
     get_model_loader,
     post_load_weights,
@@ -182,6 +184,9 @@ class WeightUpdater:
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
         )
 
+        if load_format == LoadFormat.REMOTE_INSTANCE:
+            return self._reload_weights_from_own_loader(model_path=model_path)
+
         target_device = torch.device(self.device)
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
@@ -244,6 +249,44 @@ class WeightUpdater:
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
+
+    def _reload_weights_from_own_loader(
+        self: WeightUpdater, *, model_path: str
+    ) -> tuple[bool, str]:
+        """Rewrite the weights in place from the loader that loaded them, e.g.
+        pull them from a peer after a release that discarded them."""
+        runner = self.get_model_runner()
+        if runner.load_config.load_format != LoadFormat.REMOTE_INSTANCE:
+            return False, (
+                f"load_format=remote_instance reloads through the startup loader, "
+                f"but this runner was loaded with {runner.load_config.load_format}."
+            )
+        if model_path != self.model_config.model_path:
+            return False, (
+                f"Reloading through the startup loader requires the served model "
+                f"path {self.model_config.model_path!r}, got {model_path!r}. "
+                f"Pass a disk load_format such as 'auto' to load another model."
+            )
+        loader: BaseModelLoader = runner.loader
+        try:
+            reloaded = loader.reload_weights_inplace(
+                model=self.get_model(),
+                model_config=self.model_config,
+                device_config=DeviceConfig(device=self.device, gpu_id=self.gpu_id),
+            )
+        except Exception as e:
+            logger.exception("Reloading model weights in place failed.")
+            return False, (
+                f"Failed to reload weights in place: {e}. "
+                f"The model weights may be partially overwritten; "
+                f"reload them before serving."
+            )
+        if not reloaded:
+            return False, (
+                f"Model loader {type(loader).__name__} cannot reload weights in place."
+            )
+        logger.info("Reloaded model weights in place through the startup loader.")
+        return True, "Succeeded to reload model weights."
 
     def receive_weights_from_distributed(
         self: WeightUpdater,
